@@ -13,17 +13,68 @@ logger = logging.getLogger("copairs")
 
 
 def build_rank_lists(pos_pairs, neg_pairs, pos_sims, neg_sims):
+    """
+    Build rank lists for calculating average precision.
+
+    This function processes positive and negative pairs along with their similarity scores 
+    to construct rank lists and determine unique profile indices with their associated counts.
+
+    Parameters:
+    ----------
+    pos_pairs : np.ndarray
+        Array of positive pair indices, where each pair is represented as a pair of integers.
+    
+    neg_pairs : np.ndarray
+        Array of negative pair indices, where each pair is represented as a pair of integers.
+    
+    pos_sims : np.ndarray
+        Array of similarity scores for positive pairs.
+    
+    neg_sims : np.ndarray
+        Array of similarity scores for negative pairs.
+
+    Returns:
+    -------
+    paired_ix : np.ndarray
+        Unique indices of profiles that appear in the rank lists.
+    
+    rel_k_list : np.ndarray
+        Array of relevance labels (1 for positive pairs, 0 for negative pairs) sorted by 
+        decreasing similarity within each profile.
+    
+    counts : np.ndarray
+        Array of counts indicating how many times each profile index appears in the rank lists.
+
+    Notes:
+    ------
+    - Positive pairs are labeled with `1` and negative pairs with `0`.
+    - Similarity scores are used to rank pairs, with higher similarity given higher relevance.
+    - The rank lists are sorted first by similarity (descending) and then by profile index.
+    """
+
+    # Combine relevance labels: 1 for positive pairs, 0 for negative pairs
     labels = np.concatenate(
         [
-            np.ones(pos_pairs.size, dtype=np.int32),
-            np.zeros(neg_pairs.size, dtype=np.int32),
+            np.ones(pos_pairs.size, dtype=np.int32),  # Label positive pairs
+            np.zeros(neg_pairs.size, dtype=np.int32),  # Label negative pairs
         ]
     )
+
+    # Flatten positive and negative pair indices for ranking
     ix = np.concatenate([pos_pairs.ravel(), neg_pairs.ravel()])
+
+    # Expand similarity scores to match the flattened pair indices
     sim_all = np.concatenate([np.repeat(pos_sims, 2), np.repeat(neg_sims, 2)])
+
+    # Sort by similarity (descending) and then by index (lexicographical order)
     ix_sort = np.lexsort([1 - sim_all, ix])
+
+    # Create the rank list of relevance labels sorted by similarity and index
     rel_k_list = labels[ix_sort]
+
+    # Find unique profile indices and count their occurrences in the pairs
     paired_ix, counts = np.unique(ix, return_counts=True)
+
     return paired_ix, rel_k_list, counts
 
 
