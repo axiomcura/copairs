@@ -2,19 +2,42 @@ import itertools
 import os
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Tuple
 
 import numpy as np
 from tqdm.autonotebook import tqdm
 
 
-def parallel_map(par_func, items):
-    """Execute par_func(i) for every i in items using ThreadPool and tqdm."""
+def parallel_map(par_func: Callable[[int], None], items: np.ndarray) -> None:
+    """Execute a function in parallel over a list of items.
+
+    This function uses a thread pool to process items in parallel, with progress
+    tracking via `tqdm`. It is particularly useful for batch operations that benefit
+    from multithreading.
+
+    Parameters:
+    ----------
+    par_func : Callable
+        A function to execute for each item. It should accept a single argument
+        (an item index or value).
+    items : np.ndarray
+        An array or list of items to process.
+    """
+    # Total number of items to process
     num_items = len(items)
+
+    # Determine the number of threads to use, limited by CPU count
     pool_size = min(num_items, os.cpu_count())
+
+    # Calculate chunk size for dividing work among threads
     chunksize = num_items // pool_size
+
+    # Use a thread pool to execute the function in parallel
     with ThreadPool(pool_size) as pool:
+        # Map the function to items with unordered execution for better efficiency
         tasks = pool.imap_unordered(par_func, items, chunksize=chunksize)
+
+        # Display progress using tqdm
         for _ in tqdm(tasks, total=len(items), leave=False):
             pass
 
@@ -22,18 +45,40 @@ def parallel_map(par_func, items):
 def batch_processing(
     pairwise_op: Callable[[np.ndarray, np.ndarray], np.ndarray],
 ):
-    """Decorator adding the batch_size param to run the function with
-    multithreading using a list of paired indices"""
+    """Decorator for adding batch processing to pairwise operations.
+
+    This function wraps a pairwise operation to process data in batches, enabling
+    efficient computation and multithreading when working with large datasets.
+
+    Parameters:
+    ----------
+    pairwise_op : Callable
+        A function that computes pairwise operations (e.g., similarity or distance)
+        between two arrays of features.
+
+    Returns:
+    -------
+    Callable
+        A wrapped function that processes pairwise operations in batches.
+
+    """
 
     def batched_fn(feats: np.ndarray, pair_ix: np.ndarray, batch_size: int):
+        # Total number of pairs to process
         num_pairs = len(pair_ix)
+
+        # Initialize an empty result array to store pairwise operation results
         result = np.empty(num_pairs, dtype=np.float32)
 
         def par_func(i):
+            # Extract the features for the current batch of pairs
             x_sample = feats[pair_ix[i : i + batch_size, 0]]
             y_sample = feats[pair_ix[i : i + batch_size, 1]]
+
+            # Compute pairwise operations for the current batch
             result[i : i + len(x_sample)] = pairwise_op(x_sample, y_sample)
 
+        # Use multithreading to process the batches in parallel
         parallel_map(par_func, np.arange(0, num_pairs, batch_size))
 
         return result
@@ -319,6 +364,61 @@ def average_precision(rel_k):
     return ap
 
 
+def ap_contiguous(
+    rel_k_list: np.ndarray, counts: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute Average Precision (AP) scores from relevance labels.
+
+    This function calculates Average Precision (AP) scores for each profile based on
+    relevance labels and their associated counts. It also returns configurations
+    indicating the number of positive and total pairs for each profile.
+
+    Parameters:
+    ----------
+    rel_k_list : np.ndarray
+        Array of relevance labels (1 for positive pairs, 0 for negative pairs), sorted
+        by descending similarity within profiles.
+    counts : np.ndarray
+        Array indicating how many times each profile appears in the rank list.
+
+    Returns:
+    -------
+    ap_scores : np.ndarray
+        Array of Average Precision scores for each profile.
+    null_confs : np.ndarray
+        Array of configurations, where each row corresponds to:
+        - Number of positive pairs (`num_pos`).
+        - Total number of pairs (`counts`).
+    """
+    # Convert counts into cutoff indices to segment relevance labels
+    cutoffs = to_cutoffs(counts)
+
+    # Calculate the number of positive pairs for each profile
+    num_pos = np.add.reduceat(rel_k_list, cutoffs)
+
+    # Compute the cumulative shift for handling contiguous true positives
+    shift = np.empty_like(num_pos)
+    shift[0], shift[1:] = 0, num_pos[:-1]
+
+    # Calculate cumulative true positives for each profile segment
+    tp = rel_k_list.cumsum() - np.repeat(shift.cumsum(), counts)
+
+    # Rank positions for each relevance label, adjusted by cutoff indices
+    k = np.arange(1, len(rel_k_list) + 1) - np.repeat(cutoffs, counts)
+
+    # Compute precision at each rank (precision = TP / rank)
+    pr_k = tp / k
+
+    # Calculate average precision scores for each profile
+    ap_scores = np.add.reduceat(pr_k * rel_k_list, cutoffs) / num_pos
+
+    # Generate configurations (number of positive and total pairs)
+    null_confs = np.stack([num_pos, counts], axis=1)
+
+    return ap_scores, null_confs
+
+
 def random_ap(num_perm, num_pos, total, seed):
     """
     Generate random Average Precision (AP) scores to create a null distribution.
@@ -357,33 +457,93 @@ def random_ap(num_perm, num_pos, total, seed):
     return null_dist
 
 
-def null_dist_cached(num_pos, total, seed, null_size, cache_dir):
+def null_dist_cached(
+    num_pos: int, total: int, seed: int, null_size: int, cache_dir: Path
+) -> np.ndarray:
+    """Generate or retrieve a cached null distribution for a given configuration.
+
+    This function calculates a null distribution for a specified number of positive
+    pairs (`num_pos`) and total pairs (`total`). It uses caching to store and
+    retrieve precomputed distributions, saving time and computational resources.
+
+    Parameters:
+    ----------
+    num_pos : int
+        Number of positive pairs in the configuration.
+    total : int
+        Total number of pairs (positive + negative) in the configuration.
+    seed : int
+        Random seed for reproducibility.
+    null_size : int
+        Number of samples to generate in the null distribution.
+    cache_dir : Path
+        Directory to store or retrieve cached null distributions.
+
+    Returns:
+    -------
+    np.ndarray
+        Null distribution for the specified configuration.
+    """
+    # Check if a seed is provided to enable caching
     if seed is not None:
+        # Define the cache file name based on the configuration
         cache_file = cache_dir / f"n{total}_k{num_pos}.npy"
+
+        # If the cache file exists, load the null distribution from it
         if cache_file.is_file():
             null_dist = np.load(cache_file)
         else:
+            # If the cache file doesn't exist, compute the null distribution
             null_dist = random_ap(null_size, num_pos, total, seed)
+
+            # Save the computed distribution to the cache
             np.save(cache_file, null_dist)
     else:
+        # If no seed is provided, compute the null distribution without caching
         null_dist = random_ap(null_size, num_pos, total, seed)
+
+    # Return the null distribution (loaded or computed)
     return null_dist
 
 
-def get_null_dists(confs, null_size, seed):
+def get_null_dists(confs: np.ndarray, null_size: int, seed: int) -> np.ndarray:
+    """Generate null distributions for each configuration of positive and total pairs.
+    Parameters:
+    ----------
+    confs : np.ndarray
+        Array where each row contains the number of positive pairs (`num_pos`)
+        and total pairs (`total`) for a specific configuration.
+    null_size : int
+        Number of samples to generate in the null distribution.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns:
+    -------
+    np.ndarray
+        A 2D array where each row corresponds to a null distribution for a specific
+        configuration.
+    """
+    # Define the directory for caching null distributions
     cache_dir = Path.home() / ".copairs" / f"seed{seed}" / f"ns{null_size}"
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Number of configurations and random seeds for each configuration
     num_confs = len(confs)
     rng = np.random.default_rng(seed)
     seeds = rng.integers(8096, size=num_confs)
 
+    # Initialize an array to store null distributions
     null_dists = np.empty([len(confs), null_size], dtype=np.float32)
 
+    # Function to generate null distributions for each configuration
     def par_func(i):
         num_pos, total = confs[i]
         null_dists[i] = null_dist_cached(num_pos, total, seeds[i], null_size, cache_dir)
 
+    # Parallelize the generation of null distributions
     parallel_map(par_func, np.arange(num_confs))
+
     return null_dists
 
 
@@ -467,30 +627,31 @@ def concat_ranges(start, end):
     return mask
 
 
-def to_cutoffs(counts):
-    """Convert a list of counts into cutoff indices.
+def to_cutoffs(counts: np.ndarray) -> np.ndarray:
+    """Convert counts into cumulative cutoff indices.
 
-    This function generates an array of indices where each count begins in a
-    cumulative list. The first index is always `0`, and subsequent indices
-    represent the cumulative sum of counts up to the previous entry.
+    This function generates a 1D array of indices that mark the start of each segment
+    in a cumulative list. The first index is always `0`, and subsequent indices
+    correspond to the cumulative sum of counts up to the previous entry.
 
     Parameters:
     ----------
     counts : np.ndarray
-        A 1D array of counts.
+        A 1D array of counts representing the size of each segment.
 
     Returns:
     -------
     np.ndarray
-        A 1D array of cutoff indices.
+        A 1D array of cutoff indices where each value indicates the starting index
+        for the corresponding segment.
     """
-    # Initialize an empty array with the same shape as `counts`
+    # Initialize an empty array for cutoff indices
     cutoffs = np.empty_like(counts)
 
-    # The first cutoff is always 0
+    # Set the first cutoff to 0 (start of the first segment)
     cutoffs[0] = 0
 
-    # Remaining cutoffs are the cumulative sum of counts, excluding the last element
+    # Compute subsequent cutoffs using cumulative sums, excluding the last element
     cutoffs[1:] = counts.cumsum()[:-1]
 
     return cutoffs

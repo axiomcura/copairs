@@ -13,8 +13,7 @@ logger = logging.getLogger("copairs")
 
 
 def build_rank_lists(pos_pairs, neg_pairs, pos_sims, neg_sims):
-    """
-    Build rank lists for calculating average precision.
+    """ Build rank lists for calculating average precision.
 
     This function processes positive and negative pairs along with their similarity scores 
     to construct rank lists and determine unique profile indices with their associated counts.
@@ -44,12 +43,6 @@ def build_rank_lists(pos_pairs, neg_pairs, pos_sims, neg_sims):
     
     counts : np.ndarray
         Array of counts indicating how many times each profile index appears in the rank lists.
-
-    Notes:
-    ------
-    - Positive pairs are labeled with `1` and negative pairs with `0`.
-    - Similarity scores are used to rank pairs, with higher similarity given higher relevance.
-    - The rank lists are sorted first by similarity (descending) and then by profile index.
     """
 
     # Combine relevance labels: 1 for positive pairs, 0 for negative pairs
@@ -67,6 +60,10 @@ def build_rank_lists(pos_pairs, neg_pairs, pos_sims, neg_sims):
     sim_all = np.concatenate([np.repeat(pos_sims, 2), np.repeat(neg_sims, 2)])
 
     # Sort by similarity (descending) and then by index (lexicographical order)
+    # `1 - sim_all` ensures higher similarity values appear first, prioritizing
+    # pairs with stronger similarity scores for ranking.
+    # `ix` acts as a secondary criterion, ensuring consistent ordering of pairs
+    # with equal similarity scores by their indices (lexicographical order).
     ix_sort = np.lexsort([1 - sim_all, ix])
 
     # Create the rank list of relevance labels sorted by similarity and index
